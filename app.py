@@ -74,14 +74,64 @@ def sql_lit(s: str) -> str:
 
 
 # ------------------------------------------------------------------ dataset access
-async def manifest() -> dict:
+HF_API = os.environ.get("HF_API_BASE") or f"https://huggingface.co/api/datasets/{HF_DATASET}"
+
+
+async def _manifest_file() -> dict:
     r = await _http.get(f"{DATA_BASE}/manifest.json")
     if r.status_code == 404:
+        # Hugging Face also answers 404 when a private dataset is invisible to the token.
+        try:
+            v = await _http.get(HF_API)
+            if v.status_code in (401, 403, 404):
+                raise RuntimeError(f"The server cannot see the dataset '{HF_DATASET}' with its HF_TOKEN. "
+                                   "Check HF_DATASET and HF_TOKEN in Render > Environment.")
+        except httpx.HTTPError:
+            pass
         return {"files": {}}
     if r.status_code in (401, 403):
         raise RuntimeError("Hugging Face refused access: check HF_TOKEN and HF_DATASET on the server.")
     r.raise_for_status()
     return r.json()
+
+
+_tree_cache: dict = {"t": 0.0, "files": {}}
+
+
+async def _data_tree() -> dict:
+    """Every Parquet file under data/ in the dataset, as manifest-style entries. Files uploaded by hand
+    (e.g. from the Windows converter) show up even if manifest.json doesn't list them. Cached 60 s."""
+    if time.time() - _tree_cache["t"] < 60:
+        return _tree_cache["files"]
+    files, url = {}, f"{HF_API}/tree/main/data?recursive=true&expand=false"
+    try:
+        while url:
+            r = await _http.get(url)
+            if r.status_code == 404:   # no data/ folder yet
+                break
+            r.raise_for_status()
+            for f in r.json():
+                path = f.get("path", "")
+                if f.get("type") != "file" or not path.startswith("data/") or not path.endswith(".parquet"):
+                    continue
+                size = (f.get("lfs") or {}).get("size") or f.get("size")
+                files[path[len("data"):-len(".parquet")]] = {"parquet": path, "parquet_size": size, "rows": None,
+                                                             "source_size": None, "discovered": True}
+            url = r.links.get("next", {}).get("url")
+    except httpx.HTTPError:
+        return _tree_cache["files"]   # keep the last good listing if Hugging Face hiccups
+    _tree_cache.update(t=time.time(), files=files)
+    return files
+
+
+async def manifest() -> dict:
+    m = await _manifest_file()
+    listed = m.setdefault("files", {})
+    known = {e.get("parquet") for e in listed.values()}
+    for key, e in (await _data_tree()).items():
+        if e["parquet"] not in known and key not in listed:
+            listed[key] = e
+    return m
 
 
 def local_path(repo_path: str) -> Path:
@@ -196,10 +246,12 @@ async def list_datasets() -> str:
     m = await manifest()
     files = m.get("files", {})
     if not files:
-        return "No converted files yet. Run the Colab notebook (TeraBox_to_HuggingFace.ipynb) first."
+        return ("No converted files yet. If the Colab converter (TeraBox_to_HuggingFace.ipynb) is still running, "
+                "files appear here one at a time as each table finishes (the 'OK ...' lines in Colab).")
     lines = [f"{len(files)} file(s):"]
     for p, e in sorted(files.items()):
-        lines.append(f"{p}  rows={e.get('rows'):,}  source={human(e.get('source_size'))}  "
+        rows = f"{e['rows']:,}" if isinstance(e.get("rows"), int) else "?"
+        lines.append(f"{p}  rows={rows}  source={human(e.get('source_size'))}  "
                      f"parquet={human(e.get('parquet_size'))}  converted={e.get('converted_at', '')[:10]}")
     return "\n".join(lines)
 
